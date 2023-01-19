@@ -1,9 +1,5 @@
-cv2
-numpy
-argparse
-warnings
-os
-tqdm
-glob
-oxipng
-math
+numpy==1.24.1
+opencv_python_headless==4.6.0.66
+scikit_learn==1.2.0
+svgwrite==1.4.3
+tqdm==4.64.1
