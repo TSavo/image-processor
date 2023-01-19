@@ -380,7 +380,7 @@ if __name__ == "__main__":
         files = [args.input_file]
     to_process = tqdm.tqdm(files)
     for image_file in to_process:
-        if path.isdir(image_file) or "\\transparent\\" in image_file or "\\black\\" in image_file:
+        if path.isdir(image_file) or "transparent" in os.path.dirname(image_file) or "black" in os.path.dirname(image_file):
             continue
         to_process.write(f"Processing {image_file}...")
         process_image(image_file, to_process, args)
