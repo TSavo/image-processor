@@ -323,18 +323,18 @@ def process_image(image_file, progress, args):
 
     progress.write("Applying black mask...")
     black = apply_black_mask(image, mask)
-    dirname = path.dirname(image_file)  + "\\black"
+    dirname = path.dirname(image_file)  + "/black"
     filename = path.basename(image_file).replace(".jpg", ".png").replace(".jpeg", ".png")
-    progress.write(f"Saving black image to {dirname}\\black-{filename}...")
+    progress.write(f"Saving black image to {dirname}/black-{filename}...")
     # Save the transparent image
-    compress(dirname + "\\black-" + filename, black, progress)
+    compress(dirname + "/black-" + filename, black, progress)
 
     progress.write("Applying transparency mask...")
     transparent = apply_transparency_mask(image, mask)
-    dirname = path.dirname(image_file)  + "\\transparent"
-    progress.write(f"Saving transparent image to {dirname}\\transparent-{filename}...")
+    dirname = path.dirname(image_file)  + "/transparent"
+    progress.write(f"Saving transparent image to {dirname}/transparent-{filename}...")
     # Save the transparent image
-    compress(dirname + "\\transparent-" + filename, transparent, progress)
+    compress(dirname + "/transparent-" + filename, transparent, progress)
 
 
 if __name__ == "__main__":
