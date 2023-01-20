@@ -75,7 +75,6 @@ def mask_edges(image, num_pixels, blur=0):
     mask = cv2.bitwise_not(mask)
     # Convert the mask to 3 channels
     mask = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-    cv2.imwrite("mask.png", mask)
     # Apply the mask to the image
     masked_image = np.maximum(cv2.subtract(image.astype(np.int16), mask.astype(np.int16)), (0,0,0)).astype(np.uint8)
     return masked_image
