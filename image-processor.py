@@ -185,8 +185,13 @@ import svgwrite
 
 
 def compress(image_file, image, progress, target_size = 49 * 1024 * 1024):
+    #if the image already exists, and its greater than 20 meg, then we can skip it
+    if os.path.exists(image_file) and os.path.getsize(image_file) > 20 * 1024 * 1024:
+        progress.write("Skipping " + image_file + " because it already exists and is greater than 20 megabytes")
+        return
     #encode the image as a png
     encoded = cv2.imencode('.png', image)[1]
+    original_size = len(encoded.tobytes())
     progress.write(f"Original size: {humanbytes(len(encoded.tobytes()))} bytes")
     #optimize the image with oxipng
     progress.write("Optimizing image with level " + ((str(6) + " (this may take a while)") if len(encoded.tobytes()) > target_size else str(2)) + "...")
@@ -202,6 +207,10 @@ def compress(image_file, image, progress, target_size = 49 * 1024 * 1024):
         #encode the image as a png
         encoded = cv2.imencode('.png', image)[1]
         progress.write(f"Original size: {humanbytes(len(encoded.tobytes()))} bytes")
+        #if its now bigger, reize it again
+        if len(encoded.tobytes()) > original_size:
+            progress.write("Resized image is now bigger, resizing...")
+            continue
         #optimize the image with oxipng
         progress.write("Optimizing image with level 6 (this may take a while)...")
         optimized_data = oxipng.optimize_from_memory(encoded.tobytes(), level=6)        
@@ -246,6 +255,10 @@ def humanbytes(B):
         return '{0:.2f} YB'.format(B/YB)
 
 def process_image(image_file, progress, args):
+    #if the transparent and the black version exist, skip it
+    if os.path.exists(os.path.dirname(image_file) + "/transparent/" + "transparent-" + os.path.basename(image_file.replace(".jpg", ".png"))) and os.path.exists(os.path.dirname(image_file) + "/black/" + "black-" + os.path.basename(image_file.replace(".jpg", ".png"))):
+        progress.write("Skipping " + image_file + " because it already exists")
+        return
     # Read the image
     image = cv2.imread(image_file, cv2.IMREAD_COLOR)
     progress.write(f"Working on {image_file}, which is {image.shape[1]}x{image.shape[0]} pixels and {humanbytes(os.path.getsize(image_file))} bytes")
@@ -323,18 +336,18 @@ def process_image(image_file, progress, args):
 
     progress.write("Applying black mask...")
     black = apply_black_mask(image, mask)
-    dirname = path.dirname(image_file)  + "/black"
+    dirname = path.dirname(image_file)  + os.sep + "black"
     filename = path.basename(image_file).replace(".jpg", ".png").replace(".jpeg", ".png")
-    progress.write(f"Saving black image to {dirname}/black-{filename}...")
+    progress.write(f"Saving black image to {dirname}{os.sep}black-{filename}...")
     # Save the transparent image
-    compress(dirname + "/black-" + filename, black, progress)
+    compress(dirname + os.sep + "black-" + filename, black, progress)
 
     progress.write("Applying transparency mask...")
     transparent = apply_transparency_mask(image, mask)
-    dirname = path.dirname(image_file)  + "/transparent"
-    progress.write(f"Saving transparent image to {dirname}/transparent-{filename}...")
+    dirname = path.dirname(image_file)  + os.sep + "transparent"
+    progress.write(f"Saving transparent image to {dirname}{os.sep}transparent-{filename}...")
     # Save the transparent image
-    compress(dirname + "/transparent-" + filename, transparent, progress)
+    compress(dirname + os.sep + "transparent-" + filename, transparent, progress)
 
 
 if __name__ == "__main__":
@@ -374,8 +387,11 @@ if __name__ == "__main__":
     parser.add_argument("--saturation", "-sa", help="The amount to saturate the image by", type=float, default=0)
     # Parse the command line arguments
     args = parser.parse_args()
-    if path.isdir(args.input_file):
-        files = glob(args.input_file + "/*", recursive=True)
+    use_path = args.input_file
+    if use_path.endswith("/") or use_path.endswith("\\") or use_path.endswith("\""):
+        use_path = use_path[:-1]
+    if path.isdir(use_path):
+        files = glob(use_path + os.sep + "*", recursive=True)
     else:
         files = [args.input_file]
     to_process = tqdm.tqdm(files)
