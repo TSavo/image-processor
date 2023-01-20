@@ -185,10 +185,6 @@ import svgwrite
 
 
 def compress(image_file, image, progress, target_size = 49 * 1024 * 1024):
-    #if the image already exists, and its greater than 20 meg, then we can skip it
-    if os.path.exists(image_file) and os.path.getsize(image_file) > 20 * 1024 * 1024:
-        progress.write("Skipping " + image_file + " because it already exists and is greater than 20 megabytes")
-        return
     #encode the image as a png
     encoded = cv2.imencode('.png', image)[1]
     original_size = len(encoded.tobytes())
@@ -256,7 +252,7 @@ def humanbytes(B):
 
 def process_image(image_file, progress, args):
     #if the transparent and the black version exist, skip it
-    if os.path.exists(os.path.dirname(image_file) + "/transparent/" + "transparent-" + os.path.basename(image_file.replace(".jpg", ".png"))) and os.path.exists(os.path.dirname(image_file) + "/black/" + "black-" + os.path.basename(image_file.replace(".jpg", ".png"))):
+    if not args.force and os.path.exists(os.path.dirname(image_file) + "/transparent/" + "transparent-" + os.path.basename(image_file.replace(".jpg", ".png"))) and os.path.exists(os.path.dirname(image_file) + "/black/" + "black-" + os.path.basename(image_file.replace(".jpg", ".png"))):
         progress.write("Skipping " + image_file + " because it already exists")
         return
     # Read the image
@@ -385,6 +381,7 @@ if __name__ == "__main__":
     parser.add_argument("--crop", "-cr", help="The amount to clip off the edges of the image", type=int, default=0)
     parser.add_argument("--resize", "-r", help="The amount to resize the image by", type=int, default=0)
     parser.add_argument("--saturation", "-sa", help="The amount to saturate the image by", type=float, default=0)
+    parser.add_argument("--force", "-f", help="Force the program to overwrite existing files", type=bool, default=False)
     # Parse the command line arguments
     args = parser.parse_args()
     use_path = args.input_file
