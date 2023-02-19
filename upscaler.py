@@ -1,8 +1,7 @@
 import os
 import cv2
 import numpy as np
-import glob
-import argparse
+
 
 from basicsr.archs.rrdbnet_arch import RRDBNet
 from basicsr.utils.download_util import load_file_from_url
@@ -12,7 +11,7 @@ from realesrgan.archs.srvgg_arch import SRVGGNetCompact
 
 
 class Upscaler:
-    def __init__(self, model_name="RealESRGAN_x4plus", model_path=None, denoise_strength=1, tile=512, tile_pad=10, pre_pad=0, fp32=False,
+    def __init__(self, model_name="RealESRGAN_x4plus", model_path=None, denoise_strength=1, tile=256, tile_pad=10, pre_pad=0, fp32=False,
                  gpu_id=0, face_enhance=False, outscale=1, ext='auto', suffix=''):
         self.model_name = model_name
         self.model_path = model_path
@@ -100,8 +99,6 @@ class Upscaler:
                 channel_multiplier=2,
                 bg_upsampler=self.upsampler)
     def __call__(self, img):
-
-        print('Testing')
         try:
             if self.face_enhance:
                 _, _, output = self.face_enhancer.enhance(img, has_aligned=False, only_center_face=False, paste_back=True)
@@ -118,21 +115,20 @@ class TargetUpscaler:
     def __init__(self, target_size):
         self.target_size = target_size
         self.up2x = Upscaler(model_name=f'RealESRGAN_x2plus', tile=256)
-        self.up4x = Upscaler(model_name=f'RealESRGAN_x4plus', tile=512)
+        self.up4x = Upscaler(model_name=f'RealESRGAN_x4plus', tile=256)
 
     def __call__(self, image):
         while image.shape[0] < self.target_size and image.shape[1] < self.target_size:
-            if image.shape[0] >= 4096 or image.shape[1] >= 4096:
-                image = self.up2x(image)
-            else:
+            if image.shape[0]  * 2 < self.target_size and image.shape[1] * 2 < self.target_size:
                 image = self.up4x(image)
-            #if the image is less than 4096 on the long side, use the 2x upscaler
+            else:
+                image = self.up2x(image)
             if image is None:
                 return None
         #if the longest edge is > target_sizze  resize it to be tarrget_ssizze along that edge
         if image.shape[0] > self.target_size or image.shape[1] > self.target_size:
             if image.shape[0] > image.shape[1]:
-                image = cv2.resize(image, (int(image.shape[1] * 8192 / image.shape[0]), 8192))
+                image = cv2.resize(image, (int(image.shape[1] * self.target_size / image.shape[0]), self.target_size))
             else:
-                image = cv2.resize(image, (8192, int(image.shape[0] * 8192 / image.shape[1])))
+                image = cv2.resize(image, (self.target_size, int(image.shape[0] * self.target_size / image.shape[1])))
         return image

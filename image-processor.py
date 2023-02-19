@@ -12,7 +12,8 @@ import oxipng
 import shutil
 from sklearn.cluster import MiniBatchKMeans
 from upscaler import TargetUpscaler
-import sys
+from rembg import remove
+
 
 def count_dim_pixels(image, threshold=50):
     image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -58,20 +59,30 @@ def resize(image, new_length):
         image = cv2.resize(image, (new_length, int(h * new_length / w)), interpolation=cv2.INTER_NEAREST)
     return image
 
-
-def find_mean_color(img, is_black, num_clusters=8, subsample=.25):
+def find_mean_color(img, is_black, progress, num_clusters=4, subsample=.25):
     # Subsample the image if specified
     if subsample < 1:
-        img = cv2.resize(img, (0, 0), fx=subsample, fy=subsample, interpolation=cv2.INTER_NEAREST)
+        img = cv2.resize(img, (0, 0), fx=subsample, fy=subsample, interpolation=cv2.INTER_LANCZOS4)
     # Convert the image to a single-channel, floating point representation
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     gray= gray.reshape(-1,1)
-    # Reshape the image into a 2D array of shape (m * n, 1)
-    # Apply K-Means clustering to the data, specifying the number of clusters to be 2
 
-    kmeans = MiniBatchKMeans(n_clusters=num_clusters)
+    sse = []
+    for k in range(1, 25):
+        kmeans = MiniBatchKMeans(n_clusters=k, batch_size=256*12)
+        kmeans.fit_predict(gray)
+        sse.append(kmeans.inertia_)
+        progress.write(f"{k} clusters has a squared error of {kmeans.inertia_}")
+    sse = np.array(sse)
+    derivative_1 = np.diff(sse)
+    derivative_2 = np.diff(derivative_1)
+
+    # find the elbow by locating the point where the second derivative changes sign
+    num_clusters = min(5, np.argmin(derivative_2) + 1)
+    progress.write(f"Found {num_clusters} clusters")
+
+    kmeans = MiniBatchKMeans(n_clusters=num_clusters, max_iter=1000, batch_size=256*12, n_init=250)
     labels = kmeans.fit_predict(gray)
-    # Create an image that will be used to visualize the clusters
     clustered_image = np.zeros((img.shape[0], img.shape[1], 3), dtype=np.uint8)
     colors = []
     for i in range(num_clusters):
@@ -83,21 +94,28 @@ def find_mean_color(img, is_black, num_clusters=8, subsample=.25):
         color = color[0][0].tolist()
         colors.append(color)
 
-    for i in range(img.shape[0]):
-        for j in range(img.shape[1]):
-            clustered_image[i, j] = colors[labels[i * img.shape[1] + j]]
-    cv2.imwrite("clustered.png", clustered_image.reshape(img.shape[0], img.shape[1], 3))
-    # Determine which cluster represents the background
-    if is_black:
-        dominant_cluster = np.argmin(kmeans.cluster_centers_.mean(axis=1))
-    else:
-        dominant_cluster = np.argmax(kmeans.cluster_centers_.mean(axis=1))
+    flat_labels = labels.flatten()
+    clustered_image = np.array(colors)[flat_labels].reshape(img.shape[0], img.shape[1], 3)
+    cv2.imwrite("clustered.png", clustered_image)
 
+    # Determine which is the second most dominant cluster
+    sorted_clusters = np.argsort(kmeans.cluster_centers_.mean(axis=1))
+    if is_black:
+        dominant_cluster = sorted_clusters[0]
+        second_dominant_cluster = sorted_clusters[1]
+    else:
+        dominant_cluster = sorted_clusters[-1]
+        second_dominant_cluster = sorted_clusters[-2]
+
+    # Find the mean color of the dominant cluster and the secondary dominant cluster
     pixel_indices = np.where(labels == dominant_cluster)
-    print(f"Found {len(pixel_indices[0])} pixels in dominant cluster")
+    progress.write(f"Found {len(pixel_indices[0])} pixels in dominant cluster which is {len(pixel_indices[0]) / len(labels) * 100:.2f}% of the image")
     dominant_pixels = gray[pixel_indices].astype(np.float)
     mean_color = dominant_pixels.max().astype(np.uint8)
-    return mean_color
+    secondary_dominant_pixels = gray[np.where(labels == second_dominant_cluster)].astype(np.float)
+    secondary_mean_color = secondary_dominant_pixels.max().astype(np.uint8)
+    progress.write(f"Mean color of dominant cluster is {mean_color} and secondary dominant cluster is {secondary_mean_color}")
+    return mean_color, secondary_mean_color
 
 def mask_edges(image, num_pixels, is_black, blur=0):
     height, width, _ = image.shape
@@ -186,26 +204,49 @@ def adjust_brightness_contrast(image, brightness, contrast):
     # Return the adjusted image
     return adjusted_image
 
-def compute_transparency_mask(image, threshold, is_black=True):
+def compute_wipe_mask(image, threshold, is_black=True):
     # Convert the image to grayscale
     grayscaled = cv2.cvtColor(image,cv2.COLOR_BGR2GRAY)
-
-    # Apply a threshold to the grayscaled image
+    mask = np.ones(image.shape[:2], np.uint8) * 255
     if is_black:
-        _, threshold = cv2.threshold(grayscaled, threshold, 255, cv2.THRESH_BINARY)
+        mask[np.where(grayscaled < threshold)] = 0
     else:
-        _, threshold = cv2.threshold(grayscaled, threshold, 255, cv2.THRESH_BINARY_INV)
-
-    # Return the mask
-    return threshold
-
-
-def blur_mask(mask, sigmaX, sigmaY):
-    # Blur the mask
-    mask = cv2.GaussianBlur(mask, (0,0), sigmaX=sigmaX, sigmaY=sigmaY, borderType = cv2.BORDER_DEFAULT)
-
-    # Return the blurred mask
+        mask[np.where(grayscaled >= threshold)] = 0
     return mask
+
+def compute_gray_mask(image, threshold, tolerance=0.05, is_black=True):
+    grayscaled = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    mask = np.ones(image.shape[:2], np.uint8) * 255
+    condition = ((np.abs(image[..., 0] - grayscaled) < grayscaled * tolerance) &
+                 (np.abs(image[..., 1] - grayscaled) < grayscaled * tolerance) &
+                 (np.abs(image[..., 2] - grayscaled) < grayscaled * tolerance))
+    condition &= grayscaled < threshold if is_black else grayscaled >= threshold
+    #set the mask to grayscaled inverse value only where the condition is true
+    mask[condition] = 0
+    return mask
+
+def optimize_blur_amount(mask):
+    contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    largest_contour = max(contours, key=cv2.contourArea)
+    rect = cv2.minAreaRect(largest_contour)
+    width, height = rect[1]
+    blur_amount = int((width + height) / 100)
+    return blur_amount if blur_amount % 2 == 1 else blur_amount + 1
+
+
+def blur_mask(mask, blur_amount=None, progress_bar=None):
+    if blur_amount is None:
+        blur_amount = optimize_blur_amount(mask)
+    if progress_bar is not None:
+        progress_bar.write("Blur size is {} pixels".format(blur_amount))
+    # Apply a Gaussian blur to the binary mask
+    blurred_mask = cv2.GaussianBlur(mask.astype(np.float32), (blur_amount, blur_amount), 0)
+    
+    # Convert the blurred mask back to binary format
+    blurred_mask = np.round(blurred_mask)
+    blurred_mask = blurred_mask.astype(np.uint8)
+    
+    return blurred_mask
 
 def apply_transparency_mask(image, mask):
     alpha = cv2.cvtColor(image, cv2.COLOR_BGR2BGRA)
@@ -215,10 +256,14 @@ def apply_transparency_mask(image, mask):
 def apply_mask(image, mask, is_black=True):
     # Apply the mask to the image
     masked_image = np.copy(image)
+    #invert the mask if we want to apply it to the background
+    mask = cv2.bitwise_not(mask)
+    mask = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
     if is_black:
-        masked_image[mask == 0] = 0
+        #subtract the mask from the image
+        masked_image = cv2.subtract(image, mask)
     else:
-        masked_image[mask == 0] = 255
+        masked_image = cv2.add(image, mask)
     return masked_image
     
 def sharpen(image):
@@ -310,12 +355,11 @@ def adjust_contrast(image, contrast):
     mean = np.mean(image)
 
     # Apply the contrast to the image
-    image_contrast = np.copy(image)
-    for i in range(3):
-        image_contrast[:,:,i] = np.clip((image_contrast[:,:,i] - mean) * contrast + mean, 0, 255)
+    image_contrast = np.clip((image - mean) * contrast + mean, 0, 255)
 
     # Return the contrast image
     return image_contrast
+
 
 def adjust_brightness(image, brightness):
     # Apply the brightness to the image
@@ -371,43 +415,47 @@ def rotate(image):
     # Return the rotated image
     return image
 
+def calculate_reduction_percentage(original_size, compressed_size, target_compressed_size):
+    reduction_needed = target_compressed_size - compressed_size
+    reduction_percentage = reduction_needed / original_size
+    return 1 + (reduction_percentage / 2)
 
-def compress(image_file, image, progress, target_size = 49 * 1024 * 1024):
-    #encode the image as a png
+def compress(image_file, image, progress, target_size=49 * 1024 * 1024, compression_level=4):
+    # Encode the image as a png
     encoded = cv2.imencode('.png', image)[1]
     original_size = len(encoded.tobytes())
-    progress.write(f"Original size: {humanbytes(len(encoded.tobytes()))} bytes")
-    
-    #optimize the image with oxipng
-    progress.write("Optimizing image with level " + ((str(6) + " (this may take a while)") if len(encoded.tobytes()) > target_size else str(2)) + "...")
-    optimized_data = oxipng.optimize_from_memory(encoded.tobytes(), level = 6 if len(encoded.tobytes()) > target_size else 2)
+    progress.write(f"Original size: {humanbytes(original_size)} bytes")
 
-    #use humanbytes() to format the bytes
-    progress.write(f"Optimized size: {humanbytes(len(optimized_data))} bytes")
-    while len(optimized_data) > target_size + (target_size * 0.01):
-        #compute the right amount to reduce the image by in resizing as a percentage between 0 and
-        #1, so that the new image is just under the target size
-        reduction_factor = (target_size / len(optimized_data)) * 0.99
+    # Optimize the image with oxipng
+    optimization_level = 4
+    progress.write(f"Optimizing image with level {optimization_level} (this may take a while)...")
+    optimized_data = oxipng.optimize_from_memory(encoded.tobytes(), level=optimization_level)
+    optimized_size = len(optimized_data)
+    progress.write(f"Optimized size: {humanbytes(optimized_size)} bytes")
+
+    while optimized_size > target_size and max_iterations > 0:
+        reduction_factor = calculate_reduction_percentage(original_size, optimized_size, target_size)
+        progress.write(f"Reduction factor: {reduction_factor:.2f}")
         progress.write(f"Optimized image is too big, resizing by {100 - (reduction_factor * 100):.2f}%")
-        image = cv2.resize(image, (0,0), fx=reduction_factor, fy=reduction_factor, interpolation=cv2.INTER_AREA)
+        image = cv2.resize(image, (0, 0), fx=reduction_factor, fy=reduction_factor, interpolation=cv2.INTER_AREA)
         progress.write(f"Resizing to {image.shape[1]}x{image.shape[0]} pixels")
-        #encode the image as a png
         encoded = cv2.imencode('.png', image)[1]
-        progress.write(f"Original size: {humanbytes(len(encoded.tobytes()))} bytes")
-        #if its now bigger, reize it again
-        if len(encoded.tobytes()) > original_size:
-            progress.write("Resized image is now bigger, resizing...")
-            continue
-        #optimize the image with oxipng
-        progress.write("Optimizing image with level 6 (this may take a while)...")
-        optimized_data = oxipng.optimize_from_memory(encoded.tobytes(), level=6)        
-        progress.write(f"Optimized size: {humanbytes(len(optimized_data))} bytes")
-    #if the directory doesn't exist, create it
-    if not os.path.exists(os.path.dirname(image_file)):
-        os.makedirs(os.path.dirname(image_file))
-    #save the image
+        original_size = len(encoded.tobytes())
+        progress.write(f"Original size: {humanbytes(original_size)} bytes")
+        optimized_data = oxipng.optimize_from_memory(encoded.tobytes(), level=4)
+        optimized_size = len(optimized_data)
+        progress.write(f"Optimized size: {humanbytes(optimized_size)} bytes")
+        max_iterations -= 1
+
+    
+    # Create the directory if necessary
+    os.makedirs(os.path.dirname(image_file), exist_ok=True)
+
+    # Save the image
     with open(image_file, "wb") as f:
         f.write(optimized_data)
+
+
 
 
 #write out bytes as human readable
@@ -451,16 +499,21 @@ def process_image(image_file, progress, upscaler, args):
     is_black_image = count_bright_pixels(image) < count_dim_pixels(image)
     progress.write(f"Image background is {'black' if is_black_image else 'white'}")
     #get the filenames for the black or white and transparent versions
+    base_dir = os.path.dirname(image_file)
+    base_name = os.path.basename(image_file).replace(".jpg", ".png")
+
     if is_black_image:
-        color_filename = os.path.dirname(image_file) + "/black/" + "black-" + os.path.basename(image_file).replace(".jpg", ".png")
+        color_dir = "black"
     else:
-        color_filename = os.path.dirname(image_file) + "/white/" + "white-" + os.path.basename(image_file).replace(".jpg", ".png")
-    transparent_filename = os.path.dirname(image_file) + "/transparent/" + "transparent-" + os.path.basename(image_file).replace(".jpg", ".png")
-    upscaled_filename = os.path.dirname(image_file) + "/upscaled/upscaled-" + os.path.basename(image_file).replace(".jpg", ".png")
+        color_dir = "white"
+
+    color_filename = os.path.join(base_dir, color_dir, f"{color_dir}-{base_name}")
+    transparent_filename = os.path.join(base_dir, "transparent", f"transparent-{base_name}")
+    upscaled_filename = os.path.join(base_dir, "upscaled", f"upscaled-{base_name}")
 
 
     #if the transparent and the color and the upscaled version exist, skip it
-    if not args.force and os.path.exists(color_filename) and os.path.exists(transparent_filename) and os.path.exists(upscaled_filename):
+    if not args.force and os.path.exists(color_filename) and os.path.exists(transparent_filename):
         #if the files are smaler than 48 megabytes, skip it
         if os.path.getsize(color_filename) < args.target_size and os.path.getsize(transparent_filename) < args.target_size:
             progress.write(f"Skipping {image_file}, because it already exists")
@@ -565,25 +618,56 @@ def process_image(image_file, progress, upscaler, args):
         progress.write(f"Saturation adjusted")
 
     #if threshold is not set, compute the transparency mask
-    threshold = args.threshold
-    if args.threshold == -1:
-        progress.write("Computing background color threshold...")
-        threshold = find_mean_color(image, is_black_image)
-        progress.write(f"The suggested threshold value color is: {threshold}")
+    #threshold = args.threshold
+    #if args.threshold == -1:
+        #progress.write("Computing background color threshold...")
+        #threshold = find_mean_color(image, is_black_image)
+        #progress.write(f"The suggested threshold value color is: {threshold}")
     
     #if mask is set, manually mask the edges
     if args.mask > 0:
         progress.write("Manually masking edges...")
         image = mask_edges(image, args.mask, args.blur_mask)
     
-    progress.write("Computing transparency mask...")
-    mask = compute_transparency_mask(image, threshold, is_black_image)
-  
+    progress.write("Computing background mask...")
+    #mask = compute_transparency_mask(image, threshold, is_black_image)
+ 
+    mask = remove(image, only_mask=True)
+    cv2.imwrite("mask.png", mask)
+
+    
+    #mask = blur_mask(mask,4,4)
+    #cv2.imwrite("mask_blured.png", mask)
+    #black = apply_mask(image, mask, is_black_image)
+
+
+    threshold, secondary_threshold = find_mean_color(image, is_black_image, progress, num_clusters=7)
+    progress.write(f"The suggested threshold values are: {threshold} and {secondary_threshold}")
+
+    wipe_mask = compute_wipe_mask(image, threshold, is_black_image)
+    #mask = np.bitwise_and(mask, wipe_mask)
+    mask = np.bitwise_or(mask, wipe_mask)
+
+
+    cv2.imwrite("mask_wipe.png", mask)
+    progress.write("Computing gray mask...")
+    gray_mask = compute_gray_mask(image, secondary_threshold, 0.25, is_black_image)
+    cv2.imwrite("mask_gray.png", gray_mask)
+    progress.write("Computing final mask...")
+    mask = np.bitwise_and(mask, gray_mask)
+    progress.write("Blurring final mask...")
+    mask = blur_mask(mask, None, progress)
+    cv2.imwrite("mask_final.png", mask)
+    #threshold the msdk to bring it back to black and white
+    #mask = cv2.threshold(mask, 10, 255, cv2.THRESH_BINARY)[1]
+    #cv2.imwrite("mask_final_threshold.png", mask)
+    #mask = blur_mask(mask, np.mean(mask.shape)/100, np.mean(mask.shape)/100)
+    #cv2.imwrite("mask_final_threshold_blured.png", mask)
 
     #if blur is set, blur the mask
-    if args.blur > 0:
+    if args.blur is not None:
         progress.write("Blurring mask...")
-        mask = blur_mask(mask, args.blur, args.blur)
+        mask = blur_mask(mask, args.blur, progress)
 
     if not args.skip_black:
         progress.write(f"Applying {'black' if is_black_image else 'white'} mask...")
@@ -607,7 +691,8 @@ def rename_files(input_dir):
     #glob the files, rename them
     counter = 1
     for image_file in glob(os.path.join(input_dir, "*.*"), recursive=False):
-        if os.path.basename(image_file).startswith(new_name):
+        #if the file contains the name in it, skip it
+        if os.path.basename(image_file).index(new_name) != -1:
             continue
         extension = os.path.splitext(image_file)[1]
         new_file = input_dir + os.sep + new_name + "-" + str(counter) + extension
@@ -618,6 +703,54 @@ def rename_files(input_dir):
         shutil.move(image_file, new_name)
 
 
+def finish(dir, output_file):
+    to_process.write(f"Finished {dir}...")
+    basedir = os.path.join(output_file, os.path.basename(dir))
+
+    if not os.path.isdir(basedir):
+        os.mkdir(basedir)
+    if os.path.exists(os.path.join(dir, "originals")):
+        if not os.path.isdir(os.path.join(basedir, "originals")):
+            os.mkdir(os.path.join(basedir, "originals"))
+        merge_directories(os.path.join(dir, "originals"), os.path.join(basedir, "originals"))
+    if os.path.exists(os.path.join(dir, "black")):
+        if not os.path.isdir(os.path.join(basedir, "black")):
+            os.mkdir(os.path.join(basedir, "black"))
+        merge_directories(os.path.join(dir, "black"), os.path.join(basedir, "black"))
+    if os.path.exists(os.path.join(dir, "white")):
+        if not os.path.isdir(os.path.join(basedir, "white")):
+            os.mkdir(os.path.join(basedir, "white"))
+        merge_directories(os.path.join(dir, "white"), os.path.join(basedir, "white"))
+    if os.path.exists(os.path.join(dir, "transparent")):
+        if not os.path.isdir(os.path.join(basedir, "transparent")):
+            os.mkdir(os.path.join(basedir, "transparent"))
+        merge_directories(os.path.join(dir, "transparent"), os.path.join(basedir, "transparent"))
+    if os.path.exists(os.path.join(dir, "upscaled")):
+        if not os.path.isdir(os.path.join(basedir, "upscaled")):
+            os.mkdir(os.path.join(basedir, "upscaled"))
+        merge_directories(os.path.join(dir, "upscaled"), os.path.join(basedir, "upscaled"))
+    try:
+        shutil.rmtree(os.path.join(dir, "transparent"))
+        shutil.rmtree(os.path.join(dir, "black"))
+        shutil.rmtree(os.path.join(dir, "white"))
+        shutil.rmtree(os.path.join(dir, "originals"))
+        shutil.rmtree(os.path.join(dir, "upscaled"))
+    except:
+        pass
+
+def merge_directories(input_dir, output_dir):
+    #glob the files, check if their black and transparent counterparts exist. if any don't, return False
+    for image_file in glob(os.path.join(input_dir, "*"), recursive=False):
+        if os.path.isdir(image_file):
+            if not os.path.exists(os.path.join(output_dir, os.path.basename(image_file))):
+                os.mkdir(os.path.join(output_dir, os.path.basename(image_file)))
+            merge_directories(image_file, os.path.join(output_dir, os.path.basename(image_file)))
+        else:
+            if not os.path.exists(os.path.join(output_dir)):
+                os.mkdir(os.path.join(output_dir))
+            shutil.move(image_file, os.path.join(output_dir, os.path.basename(image_file)))
+
+
 def process_directory(input_dir):
     if not os.path.exists(input_dir):
         return False
@@ -625,9 +758,12 @@ def process_directory(input_dir):
     #glob the files, check if their black and transparent counterparts exist. if any don't, return False
     for image_file in glob(os.path.join(input_dir, "*.*"), recursive=False):
         #get the filenames for the black and transparent versions
-        black_filename = os.path.dirname(image_file) + "/black/" + "black-" + os.path.basename(image_file).replace(".jpg", ".png")
-        transparent_filename = os.path.dirname(image_file) + "/transparent/" + "transparent-" + os.path.basename(image_file).replace(".jpg", ".png")
-        white_filename = os.path.dirname(image_file) + "/white/" + "white-" + os.path.basename(image_file).replace(".jpg", ".png")
+        base_dir = os.path.dirname(image_file)
+        base_name = os.path.basename(image_file).replace(".jpg", ".png")
+
+        black_filename = os.path.join(base_dir, "black", f"black-{base_name}")
+        transparent_filename = os.path.join(base_dir, "transparent", f"transparent-{base_name}")
+        white_filename = os.path.join(base_dir, "white", f"white-{base_name}")
 
         if not os.path.exists(black_filename) and not os.path.exists(white_filename):
             return False
@@ -635,11 +771,13 @@ def process_directory(input_dir):
             return False
     #move the whole directory to the ready for use dir
     print(f"Moving {input_dir} to G:/Misery Apparel/Ready For Use")
-    shutil.move(input_dir, "G:/Misery Apparel/Ready For Use")
+    #os.rename(input_dir, "G:/Misery Apparel/Ready For Use/" + os.path.basename(input_dir))
+    if len(os.listdir(input_dir)) > 0:
+        return False
+    
+    shutil.rmtree(input_dir)
     return True
 
-class ContinueOuter(Exception):
-    pass   
 
 if __name__ == "__main__":
     TOP = 0
@@ -670,7 +808,7 @@ if __name__ == "__main__":
     #Add an optional blur mask argument with a default value of 0
     parser.add_argument("--blur_mask", "-bm", help="the amount of blur to apply to the mask", type=int, default=0)
     #Add an optional blur argument with a default value of 0
-    parser.add_argument("--blur", "-u", help="the amount of blur to apply to the transparency mask", type=int, default=0)
+    parser.add_argument("--blur", "-u", help="the amount of blur to apply to the transparency mask", type=int, default=None)
     #Add an optional sharpen argument with a default value of False
     parser.add_argument("--sharpen", "-s", help="To sharpen or not, default False", type=bool, default=False)
     #Add an optional crop argument with a default value of 0
@@ -704,10 +842,7 @@ if __name__ == "__main__":
 
     # Parse the command line arguments
     args = parser.parse_args()
-    use_path = args.input_file
-    if use_path.endswith("/") or use_path.endswith("\\") or use_path.endswith("\""):
-        use_path = use_path[:-1]
-    
+    use_path = path.abspath(args.input_file)
     upscaler = TargetUpscaler(args.target_resolution)
     while True:
         if path.isdir(use_path):
@@ -716,13 +851,29 @@ if __name__ == "__main__":
             directories = [args.input_file]
     
         print(f"Processing {len(directories)} directories...")
+        import random
+        #build a list bof all the files in the directories
+        todo = []
         for directory in directories:
-            rename_files(directory)
+            #rename_files(directory)
             files = glob(directory + os.sep + "*.*", recursive=False)
-            to_process = tqdm.tqdm(files)
-            
-            for image_file in to_process:
-                to_process.write(f"Processing {image_file}...")
-                print(f"Processing {image_file}...")
+            for file in files:
+                todo.append(os.path.join(directory, file))
+
+
+        to_process = tqdm.tqdm(random.sample(todo, 5))
+        
+        for image_file in to_process:
+            directory = os.path.dirname(image_file)
+            try:
                 process_image(image_file, to_process, upscaler, args)
-            process_directory(directory)
+                #move the original into the originals directory
+                if not path.isdir(directory + os.sep + "originals"):
+                    os.mkdir(directory + os.sep + "originals")
+                os.rename(image_file, os.path.join(directory, "originals", os.path.basename(image_file)))
+                finish(directory, args.output_file)
+                process_directory(directory)
+            except Exception as e:
+                print(e)
+                print(f"Error processing {image_file}")
+                continue
