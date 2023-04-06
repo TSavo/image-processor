@@ -2,6 +2,9 @@ import cv2
 import numpy as np
 from sklearn.cluster import MiniBatchKMeans
 import oxipng
+from functools import partial
+import inspect
+import rembg
 
 
 #write out bytes as human readable
@@ -50,8 +53,6 @@ def calculate_reduction_percentage(original_size, compressed_size, target_compre
 
 def compute_optimal_clusters(mask):
     # Subsample the image if specified
-
-    sse = []
     for k in range(1, 25):
         kmeans = MiniBatchKMeans(n_clusters=k, batch_size=256*12)
         kmeans.fit_predict(mask)
@@ -64,27 +65,98 @@ def compute_optimal_clusters(mask):
     num_clusters = min(4, np.argmin(derivative_2) + 1)
     return num_clusters
 
-class PrintProgress:
-    def write(self, message):
-        print(message)
+def unwrap_image(func):
+    def unwrap(*args, **kwargs):
+        if not isinstance(args[0], tuple):
+            return func(*args, **kwargs)
 
-class ImageManipulator:
-    def __init__(self, image, progress = PrintProgress()):
-        self.image = image
-        self.progress = progress
+        image, metadata = args[0]
+        args = args[1:]
 
-    def resize(self, new_length):
-        h, w = self.image.shape[:2]
+        mapped_kwargs = {item.name: metadata.get(item.name, kwargs[item.name]) 
+                        for item in inspect.signature(func).parameters.values() 
+                        if item.kind == inspect.Parameter.KEYWORD_ONLY and item.name in kwargs}
+
+        if kwargs.get("image_key"):
+            image = metadata[kwargs["image_key"]]
+
+        result = func(image, *args, **mapped_kwargs)
+
+        if isinstance(result, tuple):
+            result, new_metadata = result
+            metadata.update(new_metadata)
+
+        if kwargs.get("save_key"):
+            metadata[kwargs["save_key"]] = result
+
+        return image, metadata if isinstance(result, tuple) else result, metadata
+    return unwrap
+class ImageEditor:
+
+    @unwrap_image
+    def load_image_from_file(self, image_path):
+        image = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+        return image, {"filename": image_path, "file_size": os.path.getsize(image_path), "original_dimensions": image.shape}
+    
+    @unwrap_image
+    def load_image_from_bytes(self, image_bytes):
+        image = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_UNCHANGED)
+        return image, {"file_size": len(image_bytes)}
+    
+
+
+    @unwrap_image
+    def encode(self, image, image_format="png", quality=100):
+        if image_format == "png":
+            return cv2.imecode(".png", image, [cv2.IMWRITE_PNG_COMPRESSION, quality])
+        elif image_format == "jpg":
+            return cv2.imecode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        elif image_format == "webp":
+            return cv2.imecode(".webp", image, [cv2.IMWRITE_WEBP_QUALITY, quality])
+        elif image_format == "tiff":
+            return cv2.imecode(".tiff", image, [cv2.IMWRITE_TIFF_COMPRESSION, quality])
+        elif image_format == "jpeg2000":
+            return cv2.imecode(".jp2", image, [cv2.IMWRITE_JPEG2000_COMPRESSION_X1000, quality])
+        else:
+            return cv2.imencode(f".{image_format}", image)
+
+    def write(self, image, filename):
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        with open(filename, "wb") as f:
+            f.write(image.tobytes())
+
+    @unwrap_image
+    def save_as(self, image, filename):
+        cv2.imwrite(filename, image)
+        return image, {"file_size": os.path.getsize(filename)}
+
+    def update_metadata(self, t, update_func):
+        image, metadata = t
+        kws = {item.name: metadata.get(item.name, None) for item in inspect.signature(update_func).parameters.values() if item.kind == inspect.Parameter.KEYWORD_ONLY}
+        for k, v in kws.items():
+            metadata[k] = update_func(**{k: v})
+        return image, metadata
+
+
+    @unwrap_image
+    def resize(self, image, new_length, interpolation=cv2.INTER_NEAREST):
+        h, w = image.shape[:2]
         if h > w:
             # resize the image by specifying the new height
-            self.image = cv2.resize(self.image, (int(w * new_length / h), new_length), interpolation=cv2.INTER_NEAREST)
+            image = cv2.resize(image, (int(w * new_length / h), new_length), interpolation=interpolation)
         else:
             # resize the image by specifying the new width
-            self.image = cv2.resize(self.image, (new_length, int(h * new_length / w)), interpolation=cv2.INTER_NEAREST)
-        return self
-    
-    def mask_edges(self, num_pixels, is_black, blur=0):
-        height, width, _ = self.image.shape
+            image = cv2.resize(image, (new_length, int(h * new_length / w)), interpolation=interpolation)
+        return image
+    @unwrap_image
+    def set_blur(self, image, blur_amount):
+        return image, {"blur": blur_amount}
+    @unwrap_image
+    def set_blur_multiplier(self, image, blur_multiplier):
+        return image, {"blur_multiplier": blur_multiplier}
+    @unwrap_image
+    def mask_edges(self, image, num_pixels=10, bias=0, blur=0, blur_multiplier=1):
+        height, width, _ = image.shape
         x = num_pixels
         # Create a black image with the same dimensions as the original image
         mask = np.zeros((height, width), dtype="uint8")
@@ -94,202 +166,473 @@ class ImageManipulator:
         if blur > 0:
             if blur % 2 == 0:
                 blur += 1
-            mask = cv2.GaussianBlur(mask, (blur,blur), blur * 2000000)
+            mask = cv2.GaussianBlur(mask, (blur,blur), blur * blur_multiplier)
         #invert the mask
         mask = cv2.bitwise_not(mask)
         # Convert the mask to 3 channels
         mask = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
         # Apply the mask to the image
-        if is_black:
-            self.image = np.maximum(cv2.subtract(self.image.astype(np.int16), mask.astype(np.int16)), (0,0,0)).astype(np.uint8)
+        if bias == 0:
+            image = np.maximum(cv2.subtract(image.astype(np.int16), mask.astype(np.int16)), (0,0,0)).astype(np.uint8)
         else:
-            self.image = np.minimum(cv2.add(self.image.astype(np.int16), mask.astype(np.int16)), (255,255,255)).astype(np.uint8)
-        return self
-
-    def count_dim_pixels(self, threshold=50):
-        image = cv2.cvtColor(self.image, cv2.COLOR_BGR2GRAY)
+            image = np.minimum(cv2.add(image.astype(np.int16), mask.astype(np.int16)), (255,255,255)).astype(np.uint8)
+        return image
+    @unwrap_image
+    def count_dim_pixels(self, image, threshold=50):
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         return np.sum(image < threshold)
-
-    def count_bright_pixels(self, threshold=230):
-        image = cv2.cvtColor(self.image, cv2.COLOR_BGR2GRAY)
+    @unwrap_image
+    def count_bright_pixels(self, image, threshold=230):
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         return np.sum(image > threshold)
-    def count_pixels(self):
-        return self.image.shape[0] * self.image.shape[1]
-    def brightness(self, brightness):
-        self.image = cv2.convertScaleAbs(self.image, alpha=brightness)
-        return self
-    def contrast(self, contrast):
-        self.image = cv2.convertScaleAbs(self.image, beta=contrast)
-        return self
-    def saturation(self, saturation):
-        self.image = cv2.cvtColor(self.image, cv2.COLOR_BGR2HSV)
-        self.image[:, :, 1] = cv2.convertScaleAbs(self.image[:, :, 1], alpha=saturation)
-        self.image = cv2.cvtColor(self.image, cv2.COLOR_HSV2BGR)
-        return self
-    def hue(self, hue):
-        self.image = cv2.cvtColor(self.image, cv2.COLOR_BGR2HSV)
-        self.image[:, :, 0] = cv2.convertScaleAbs(self.image[:, :, 0], alpha=hue)
-        self.image = cv2.cvtColor(self.image, cv2.COLOR_HSV2BGR)
-        return self
-    def gamma(self, gamma):
-        self.image = np.array(255 * (self.image / 255) ** gamma, dtype='uint8')
-        return self
-    def sharpen(self):
-        self.image = cv2.filter2D(self.image, -1, np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]]))
-        return self
-    def blur(self, blur):
-        self.image = cv2.blur(self.image, (blur, blur))
-        return self
-    def noise(self, noise):
-        self.image = cv2.blur(self.image, (noise, noise))
-        return self
-    def temperature(self, temperature):
-        self.image = cv2.cvtColor(self.image, cv2.COLOR_BGR2HSV)
-        self.image[:, :, 2] = cv2.convertScaleAbs(self.image[:, :, 2], alpha=temperature)
-        self.image = cv2.cvtColor(self.image, cv2.COLOR_HSV2BGR)
-        return self
-    def tint(self, tint):
-        self.image = cv2.cvtColor(self.image, cv2.COLOR_BGR2HSV)
-        self.image[:, :, 1] = cv2.convertScaleAbs(self.image[:, :, 1], alpha=tint)
-        self.image = cv2.cvtColor(self.image, cv2.COLOR_HSV2BGR)
-        return self
-    def exposure(self, exposure):
-        self.image = cv2.cvtColor(self.image, cv2.COLOR_BGR2HSV)
-        self.image[:, :, 0] = cv2.convertScaleAbs(self.image[:, :, 0], alpha=exposure)
-        self.image = cv2.cvtColor(self.image, cv2.COLOR_HSV2BGR)
-        return self
-    def rotate(self, angle):
-        self.image = cv2.rotate(self.image, angle)
-        return self
-    def flip(self, flip):
-        self.image = cv2.flip(self.image, flip)
-        return self
-    def crop(self, x, y, width, height):
-        self.image = self.image[y:y+height, x:x+width]
-        return self
-    def resize(self, width, height):
-        self.image = cv2.resize(self.image, (width, height), interpolation=cv2.INTER_LANCZOS4)
-        return self
-    def resize_to(self, longest_side):
-        if self.image.shape[0] > self.image.shape[1]:
-            self.image = cv2.resize(self.image, (int(longest_side * self.image.shape[1] / self.image.shape[0]), longest_side), interpolation=cv2.INTER_LANCZOS4)
-        elif self.image.shape[0] < self.image.shape[1]:
-            self.image = cv2.resize(self.image, (longest_side, int(longest_side * self.image.shape[0] / self.image.shape[1])), interpolation=cv2.INTER_LANCZOS4)
-        else:
-            self.image = cv2.resize(self.image, (longest_side, longest_side), interpolation=cv2.INTER_LANCZOS4)
-        return self
-    def grain(self, grain):
-        # Add grain to the image
-        self.image = self.image + grain * np.random.randn(*self.image.shape)
-        return self
-    def vignette(self, level = 1, is_black=True): 
-        height, width = self.image.shape[:2]
+    @unwrap_image
+    def count_pixels(self, image):
+        return image.shape[0] * image.shape[1]
+    @unwrap_image
+    def brightness(self, image, brightness):
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        h, s, v = cv2.split(hsv)
+        v = np.clip(v + brightness, 0, 255)
+        final_hsv = cv2.merge((h, s, v))
+        image = cv2.cvtColor(final_hsv, cv2.COLOR_HSV2BGR)
+        return image
+    @unwrap_image
+    def contrast(self, image, contrast):
+        alpha = 1.0 + contrast / 127.0
+        beta = -contrast
+        image = cv2.addWeighted(image, alpha, image, 0, beta)
+        return image
+    @unwrap_image
+    def saturation(self, image, saturation):
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        h, s, v = cv2.split(hsv)
+        s = np.clip(s + saturation, 0, 255)
+        final_hsv = cv2.merge((h, s, v))
+        image = cv2.cvtColor(final_hsv, cv2.COLOR_HSV2BGR)
+        return image
+    @unwrap_image
+    def hue(self, image, hue):
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        h, s, v = cv2.split(hsv)
+        h = np.clip(h + hue, 0, 255)
+        final_hsv = cv2.merge((h, s, v))
+        image = cv2.cvtColor(final_hsv, cv2.COLOR_HSV2BGR)
+        return image
+    @unwrap_image
+    def sharpen(self, image, sharpen):
+        kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+        image = cv2.filter2D(image, -1, kernel)
+        return image
+    @unwrap_image
+    def blur(self, image, blur):
+        image = cv2.blur(image, (blur, blur))
+        return image
+    @unwrap_image
+    def gaussian_blur(self, image, gaussian_blur):
+        image = cv2.GaussianBlur(image, (gaussian_blur, gaussian_blur), 0)
+        return image
+    @unwrap_image
+    def median_blur(self, image, median_blur):
+        image = cv2.medianBlur(image, median_blur)
+        return image
+    @unwrap_image
+    def bilateral_blur(self, image, bilateral_blur):
+        image = cv2.bilateralFilter(image, bilateral_blur, bilateral_blur * 2, bilateral_blur / 2)
+        return image
+    @unwrap_image
+    def rotate(self, image, angle):
+        image = cv2.rotate(image, angle)
+        return image
+    @unwrap_image
+    def flip(self, image, flip):
+        image = cv2.flip(image, flip)
+        return image
+    @unwrap_image
+    def crop(self, image, x, y, w, h):
+        image = image[y:y+h, x:x+w]
+        return image
+    @unwrap_image
+    def resize_to(self, image, width, height):
+        image = cv2.resize(image, (width, height), interpolation=cv2.INTER_NEAREST)
+        return image
+    @unwrap_image
+    def salt_and_pepper(self, image, amount):
+        image = image.copy()
+        num_salt = np.ceil(amount * image.size * 0.5)
+        coords = [np.random.randint(0, i - 1, int(num_salt)) for i in image.shape]
+        image[coords] = 1
+        num_pepper = np.ceil(amount * image.size * 0.5)
+        coords = [np.random.randint(0, i - 1, int(num_pepper)) for i in image.shape]
+        image[coords] = 0
+        return image
+    @unwrap_image
+    def temperature(self, image, temperature):
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        image[:, :, 2] = cv2.convertScaleAbs(image[:, :, 2], alpha=temperature)
+        image = cv2.cvtColor(image, cv2.COLOR_HSV2BGR)
+        return image
+    @unwrap_image
+    def tint(self, image, tint):
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        image[:, :, 1] = cv2.convertScaleAbs(image[:, :, 1], alpha=tint)
+        image = cv2.cvtColor(image, cv2.COLOR_HSV2BGR)
+        return image
+    @unwrap_image
+    def gamma(self, image, gamma):
+        image = np.power(image / float(np.max(image)), gamma)
+        return image
+    @unwrap_image
+    def equalize(self, image):
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2YUV)
+        image[:, :, 0] = cv2.equalizeHist(image[:, :, 0])
+        image = cv2.cvtColor(image, cv2.COLOR_YUV2BGR)
+        return image
+    @unwrap_image
+    def grayscale(self, image):
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        return image
+    @unwrap_image
+    def sepia(self, image):
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2YUV)
+        image[:, :, 0] = cv2.equalizeHist(image[:, :, 0])
+        image = cv2.cvtColor(image, cv2.COLOR_YUV2BGR)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image = cv2.transform(image, np.matrix([[0.393, 0.769, 0.189], [0.349, 0.686, 0.168], [0.272, 0.534, 0.131]]))
+        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        return image
+    @unwrap_image
+    def invert(self, image):
+        image = cv2.bitwise_not(image)
+        return image
+    @unwrap_image
+    def solarize(self, image, threshold):
+        image = np.where(image < threshold, image, 255 - image)
+        return image
+    @unwrap_image
+    def solarize_add(self, image, threshold, addition=0):
+        image = np.where(image < threshold, image + addition, image)
+        return image
+    @unwrap_image
+    def posterize(self, image, bits):
+        shift = 8 - bits
+        image = np.right_shift(np.left_shift(image, shift), shift)
+        return image
+    @unwrap_image
+    def tint(self, image, tint):
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        image[:, :, 1] = cv2.convertScaleAbs(image[:, :, 1], alpha=tint)
+        image = cv2.cvtColor(image, cv2.COLOR_HSV2BGR)
+        return image
+    @unwrap_image
+    def grain(self, image, grain):
+        image = image + grain * np.random.randn(*image.shape)
+        return image
+    @unwrap_image
+    def vignette(self, image, level = 1, bias=0):
+        height, width = image.shape[:2]
         x_resultant_kernel = cv2.getGaussianKernel(width, width/level)
         y_resultant_kernel = cv2.getGaussianKernel(height, height/level)
-        kernel = y_resultant_kernel * x_resultant_kernel.T
-        mask = kernel / kernel.max()
-        if is_black:
-            self.image = self.image * mask[:, :, np.newaxis]
-        else:
-            self.image = self.image * (1 - mask[:, :, np.newaxis])
-        return self
-    def vignette_sides(self, dim_factor=0.5, is_black=True):
-        height, width = self.image.shape[:2]
-
-        # Create the vignette mask using absolute horizontal distance
+        kernel = y_resultant_kernel * x_resultant_kernel
+        kernel = kernel / np.max(kernel)
+        if bias == 0:
+            kernel = 1 - kernel
+        image = cv2.filter2D(image, -1, kernel)
+        return image
+    @unwrap_image
+    def vignette_sides(self, image, dim_factor=0.5, bias=0):
+        height, width = image.shape[:2]
         x = np.linspace(-1, 1, width)
         vignette_mask = 1 - np.abs(np.tile(x, (height, 1)))
-
-        # Apply the mask to the image
-        image_vignette = np.copy(self.image)
-        if is_black:
+        image_vignette = np.copy(image)
+        if bias == 0:
             vignette_mask = vignette_mask * dim_factor + (1 - dim_factor)
-            image_vignette = np.maximum(image_vignette * vignette_mask[:,:,np.newaxis], 0)
-        else:
-            vignette_mask = vignette_mask * (1 - dim_factor)
-            image_vignette = np.minimum(image_vignette * vignette_mask[:,:,np.newaxis], 255)
-        self.image = image_vignette
-        return self
-
-    def vignette_corners(self, dim_factor=0.5, is_black=True):
-        height, width = self.image.shape[:2]
-
-        # Create the vignette mask using absolute horizontal and vertical distance
+        image_vignette = image_vignette * vignette_mask
+        return image_vignette
+    @unwrap_image
+    def vignette_corners(self, image, dim_factor=0.5, bias=0):
+        height, width = image.shape[:2]
         x = np.linspace(-1, 1, width)
         y = np.linspace(-1, 1, height)
-        xx, yy = np.meshgrid(x, y)
-        vignette_mask = 1 - np.sqrt(xx**2 + yy**2)
-
+        x_mask, y_mask = np.meshgrid(x, y)
+        mask = np.sqrt(x_mask**2 + y_mask**2)
+        mask = np.clip(mask, 0, 1) * dim_factor + (1 - dim_factor)
+        if bias == 0:
+            mask = 1 - mask
+        image = image * mask
+        return image
+    @unwrap_image
+    def vignette_circle(self, image, dim_factor=0.5, bias=0):
+        height, width, channels = image.shape
+        center = (int(width/2), int(height/2))
+        radius = int(np.sqrt((height/2)**2 + (width/2)**2))
+        # Create a meshgrid of the image dimensions
+        x, y = np.meshgrid(np.arange(width), np.arange(height))
+        # Calculate the distance from each pixel to the center of the circle
+        dist = np.sqrt((x - center[0])**2 + (y - center[1])**2)
+        # Normalize the distance so that it is between 0 and 1
+        norm_dist = dist / radius
+        # Calculate the dimness as a function of the distance from the center
+        dimness = 1 - norm_dist
+        # Create a circular mask based on the dimness
+        mask = (dimness * 255).clip(0, 255).astype(np.uint8)
+        mask = mask * dim_factor + (1 - dim_factor)
+        if bias == 0:
+            mask = 255 - mask
+        image = image * mask
+        return image
+    @unwrap_image
+    def vignette_at(self, image, x, y, radius, dim_factor=0.5, bias=0):
+        height, width = image.shape[:2]
+        x = np.linspace(-1, 1, width)
+        y = np.linspace(-1, 1, height)
+        x_mask, y_mask = np.meshgrid(x, y)
+        mask = np.sqrt((x_mask - x)**2 + (y_mask - y)**2)
+        mask = np.clip(mask, 0, radius)
+        mask = mask * dim_factor + (1 - dim_factor)
+        if bias == 0:
+            mask = 1 - mask
+        image = image * mask
+        return image
+    @unwrap_image
+    def vignette_at_multiple(self, image, points, radius, dim_factor=0.5, bias=0):
+        for point in points:
+            image = self.vignette_at(image, point[0], point[1], radius, dim_factor, bias)
+        return image
+    @unwrap_image
+    def vignette_at_multiple_random(self, image, num_random, radius, dim_factor=0.5, bias=0):
+        return self.vignette_at_multiple(image, self.random_points(image, num_random), radius, dim_factor, bias)
+    @unwrap_image
+    def random_points(self, image, num_random=5):
+        height, width = image.shape[:2]
+        points = []
+        for _ in range(num_random):
+            x = np.random.uniform(0, height)
+            y = np.random.uniform(0, width)
+            points.append((x, y))
+        return points
+    @unwrap_image
+    def grayscale(self, image):
+        if image.shape[2] == 4:
+            image = cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
+        if image.shape[2] == 3:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        return image
+    @unwrap_image
+    def dim_pixels(self, image, lower_threshold=50):
+        image, metadata = self.grayscale(image)
+        metadata['dim_pixels'] = np.sum(image < lower_threshold)
+        return image, metadata
+    @unwrap_image
+    def bright_pixels(self, image, upper_threshold=255-50):
+        image, metadata = self.grayscale(image)
+        metadata['bright_pixels'] = np.sum(image > upper_threshold)
+        return image, metadata
+    @unwrap_image
+    def bias(self, image, lower_threshold=50, upper_threshold=255-50):
+        image = self.dim_pixels(image, lower_threshold=lower_threshold)
+        image = self.bright_pixels(image, upper_threshold=upper_threshold)
+        image, metadata = image
+        metadata['bias'] = 0 if metadata['dim_pixels'] > metadata['bright_pixels'] else 255
+        return image, metadata
+    @unwrap_image
+    def mask(self, image, mask=None, bias=None):
+        if mask is None:
+            raise ValueError('No mask found in metadata')
+        if bias is None:
+            image, metadata = self.bias(image)
+            bias = metadata['bias']
         # Apply the mask to the image
-        image_vignette = np.copy(self.image)
-        if is_black:
-            vignette_mask = vignette_mask * dim_factor + (1 - dim_factor)
-            image_vignette = np.maximum(image_vignette * vignette_mask[:,:,np.newaxis], 0)
-        else:
-            vignette_mask = vignette_mask * (1 - dim_factor)
-            image_vignette = np.minimum(image_vignette * vignette_mask[:,:,np.newaxis], 255)
-        self.image = image_vignette
-        return self
-
-    def mask(self, mask, is_black=True):
-        # Apply the mask to the image
-        masked_image = np.copy(self.image)
+        masked_image = np.copy(image)
         #invert the mask if we want to apply it to the background
-        mask = cv2.bitwise_not(mask)
-        mask = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-        if is_black:
+        if mask.shape[2] == 1:
+            mask = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+        transparency = None
+        #if the image has transparency, we need to remove it
+        if image.shape[2] == 4:
+            transparency = image[:, :, 3]
+            image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+        if bias == 0:
             #subtract the mask from the image
-            masked_image = cv2.subtract(self.image, mask)
+            masked_image = cv2.subtract(image, mask)
         else:
-            masked_image = cv2.add(self.image, mask)
-        self.image = masked_image
-        return self
-
-    def get_gray_mask(self, threshold, tolerance=0.05, is_black=True):
-        grayscaled = cv2.cvtColor(self.image, cv2.COLOR_BGR2GRAY)
-        mask = np.ones(self.image.shape[:2], np.uint8) * 255
-        condition = ((np.abs(self.image[..., 0] - grayscaled) < grayscaled * tolerance) &
-                    (np.abs(self.image[..., 1] - grayscaled) < grayscaled * tolerance) &
-                    (np.abs(self.image[..., 2] - grayscaled) < grayscaled * tolerance))
-        condition &= grayscaled < threshold if is_black else grayscaled >= threshold
-        #set the mask to grayscaled inverse value only where the condition is true
-        mask[condition] = 0
-        return mask
-
-    def mask_transparent(self, mask):
-        alpha = cv2.cvtColor(self.image, cv2.COLOR_BGR2BGRA)
-        alpha[:,:,3] = mask
-        self.image = alpha
-        return self
-    
-    def get_threshold_mask(self, threshold, is_black=True):
+            masked_image = cv2.add(image, mask)
+        #if the image had transparency, we need to add it back
+        if transparency is not None:
+            masked_image = cv2.cvtColor(masked_image, cv2.COLOR_BGR2BGRA)
+            masked_image[:, :, 3] = transparency
+        return masked_image, metadata
+    @unwrap_image
+    def mask_transparent(self, image, mask=None):
+        if mask is None:
+            raise ValueError('No mask found in metadata')
+        if image.shape[2] != 4:
+            image = self.convert_to_transparent(image)
+        image[:, :, 3] = mask
+        return image
+    @unwrap_image
+    def convert_to_transparent(self, image):
+        alpha = cv2.cvtColor(image, cv2.COLOR_BGR2BGRA)
+        return alpha
+    @unwrap_image
+    def and_together(self, image1, image2):
+        if isinstance(image2, tuple):
+            image2 = image2[0]
+        return cv2.bitwise_and(image1, image2)
+    @unwrap_image
+    def or_together(self, image1, image2):
+        if isinstance(image2, tuple):
+            image2 = image2[0]
+        return cv2.bitwise_or(image1, image2)
+    @unwrap_image
+    def xor_together(self, image1, image2):
+        if isinstance(image2, tuple):
+            image2 = image2[0]
+        return cv2.bitwise_xor(image1, image2)
+    @unwrap_image
+    def not_together(self, image1, image2):
+        if isinstance(image2, tuple):
+            image2 = image2[0]
+        return cv2.bitwise_not(image1, image2)
+    @unwrap_image
+    def add(self, image1, image2):
+        if isinstance(image2, tuple):
+            image2 = image2[0]
+        return cv2.add(image1, image2)
+    @unwrap_image
+    def subtract(self, image1, image2):
+        if isinstance(image2, tuple):
+            image2 = image2[0]
+        return cv2.subtract(image1, image2)
+    @unwrap_image
+    def multiply(self, image1, image2):
+        if isinstance(image2, tuple):
+            image2 = image2[0]
+        return cv2.multiply(image1, image2)
+    @unwrap_image
+    def divide(self, image1, image2):
+        if isinstance(image2, tuple):
+            image2 = image2[0]
+        return cv2.divide(image1, image2)
+    @unwrap_image
+    def get_threshold_mask(self, image):
+        image, metadata = image
+        threshold = metadata['threshold']
+        if threshold is None:
+            raise ValueError('No threshold found in metadata')
+        bias = metadata['bias']
+        if bias is None:
+            bias = 0
         # Convert the image to grayscale
-        grayscaled = cv2.cvtColor(self.image,cv2.COLOR_BGR2GRAY)
-        mask = np.ones(self.image.shape[:2], np.uint8) * 255
-        if is_black:
+        grayscaled = self.grayscale(image)
+        mask = np.ones(image.shape[:2], np.uint8) * 255
+        if bias == 0:
             mask[np.where(grayscaled < threshold)] = 0
         else:
             mask[np.where(grayscaled >= threshold)] = 0
         return mask
+    #find the background color using a histogram to find the black or white spike
+    @unwrap_image
+    def find_background_color(self, image, bias=0):
+        # Convert the image to grayscale
+        grayscaled = self.grayscale(image)
+        # Find the histogram of the image
+        hist = cv2.calcHist([grayscaled], [0], None, [256], [0, 256])
+        # Find the lower and upper peaks of the histogram
+        lower_peak = np.argmin(hist)
+        upper_peak = np.argmax(hist)
+        # Find the background color
+        if bias == 0:
+            return lower_peak
+        else:
+            return upper_peak
+
+    @unwrap_image
+    def subsample(self, image, subsample=.25):
+        return image, {'subsample': subsample}
+    @unwrap_image
+    def mask_background_canny(self, image):
+        # use cv2 to find the contours
+        edges = cv2.Canny(image, 100, 200)
+        # find the largest contour
+        contours, hierarchy = cv2.findContours(edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        largest_contour = max(contours, key=cv2.contourArea)
+        # create a mask of the largest contour
+        mask = np.zeros(image.shape, np.uint8)
+        cv2.drawContours(mask, [largest_contour], 0, 255, -1)
+        return image, {'canny_mask': mask}
+    @unwrap_image
+    def mask_background_rembg(self, image, name='rembg_mask', **kwargs):
+        mask = rembg.remove(image, only_mask=True, **kwargs)
+        return image, {name: mask}
+    @unwrap_image
+    def threshold_mask(self, image, bias=0, threshold=0, name='threshold_mask'):
+        # Convert the image to grayscale
+        grayscaled = self.grayscale(image)
+        mask = np.ones(image.shape[:2], np.uint8) * 255
+        if bias == 0:
+            mask[np.where(grayscaled < threshold)] = 0
+        else:
+            mask[np.where(grayscaled >= threshold)] = 0
+        return image, {name: mask}
+
+    @unwrap_image
+    def dominant_colors(self, image, bias=0, num_clusters=-1):
+        # Convert the image to a single-channel, floating point representation
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        gray= gray.reshape(-1,1)
+
+        if num_clusters < 2:
+            num_clusters = self.compute_num_clusters(gray, bias)
+
+        kmeans = MiniBatchKMeans(n_clusters=num_clusters, max_iter=10000, batch_size=256*12, n_init=250)
+        labels = kmeans.fit_predict(gray)
+        clustered_image = np.zeros((self.image.shape[0], self.image.shape[1], 3), dtype=np.uint8)
+        colors = []
+        for i in range(num_clusters):
+            h = i / num_clusters
+            s = 1.0
+            v = 1.0
+            color = np.uint8([[[h * 180, s * 255, v * 255]]])
+            color = cv2.cvtColor(color, cv2.COLOR_HSV2BGR)
+            color = color[0][0].tolist()
+            colors.append(color)
+
+        flat_labels = labels.flatten()
+        clustered_image = np.array(colors)[flat_labels].reshape(image.shape[0], image.shape[1], 3)
+
+
+        # Determine which is the second most dominant cluster
+        sorted_clusters = np.argsort(kmeans.cluster_centers_.mean(axis=1))
+        if bias == 0:
+            dominant_cluster = sorted_clusters[0]
+            second_dominant_cluster = sorted_clusters[1]
+        else:
+            dominant_cluster = sorted_clusters[-1]
+            second_dominant_cluster = sorted_clusters[-2]
+        # Find the mean color of the dominant cluster and the secondary dominant cluster
+        dominant_pixels = image[np.where(labels == dominant_cluster)]
+        secondary_dominant_pixels = image[np.where(labels == second_dominant_cluster)]
+        if bias == 0:
+            mean_color = gray[np.where(labels == dominant_cluster)].max(axis=0).astype(np.uint8)
+            secondary_mean_color = gray[np.where(labels == second_dominant_cluster)].max(axis=0).astype(np.uint8)
+        else:
+            mean_color = gray[np.where(labels == dominant_cluster)].min(axis=0).astype(np.uint8)
+            secondary_mean_color = gray[np.where(labels == second_dominant_cluster)].min(axis=0).astype(np.uint8)
+        return image, {'dominant_color':mean_color, 'dominant_pixels':dominant_pixels, 'secondary_dominant_color':secondary_mean_color, 'secondary_dominant_pixels':secondary_dominant_pixels, 'num_clusters':num_clusters, 'clustered_image':clustered_image}
     
-    def brightness_contrast(self, brightness, contrast):
-        # Calculate the actual brightness and contrast values
-        alpha = contrast * 2 + 1
-        beta = brightness * 255
 
-        # Scale and shift the pixel values of the image
-        adjusted_image = cv2.convertScaleAbs(self.image, alpha=alpha, beta=beta)
+class ImageManipulator:
+    def __init__(self, image, editor = ImageEditor()):
+        self.image = image
+        self.imageEditor = editor
 
-        # Clamp the pixel values to the valid range
-        adjusted_image = np.clip(adjusted_image, 0, 255)
+    def __getattr__(self, name):
+        if hasattr(self.imageEditor, name):
+            return partial(getattr(self.imageEditor, name), self.image)
+        else:
+            raise AttributeError("ImageEditor has no attribute: " + name)
 
-        # Return the adjusted image
-        self.image = adjusted_image
-        return self   
-
-
-
-    def find_mean_color(self, is_black, num_clusters=-1, subsample=.25):
+    def find_mean_color(self, bias, num_clusters=-1, subsample=.25):
         # Subsample the image if specified
         if subsample < 1:
             image = cv2.resize(self.image, (0, 0), fx=subsample, fy=subsample, interpolation=cv2.INTER_LANCZOS4)
@@ -300,7 +643,7 @@ class ImageManipulator:
         gray= gray.reshape(-1,1)
 
         if num_clusters < 2:
-            num_clusters = self.compute_num_clusters(gray, is_black)
+            num_clusters = self.compute_num_clusters(gray, bias)
         self.progress.write(f"Found {num_clusters} clusters")
 
         kmeans = MiniBatchKMeans(n_clusters=num_clusters, max_iter=1000, batch_size=256*12, n_init=250)
@@ -322,7 +665,7 @@ class ImageManipulator:
 
         # Determine which is the second most dominant cluster
         sorted_clusters = np.argsort(kmeans.cluster_centers_.mean(axis=1))
-        if is_black:
+        if bias == 0:
             dominant_cluster = sorted_clusters[0]
             second_dominant_cluster = sorted_clusters[1]
         else:
